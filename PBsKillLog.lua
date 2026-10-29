@@ -127,22 +127,23 @@ end
 -- Where the log applies
 ---------------------------------------------------------------------------------------------------
 
--- Cyrodiil itself, and nothing else the kill feed also covers. The Imperial City is a zone of its own
--- (IsInCyrodiil is false there), its campaigns are fought on a different map entirely even though the
--- world is still Cyrodiil's (PB's CyrodiilAlert makes the same cut), and a Battleground is neither.
-function ADDON.IsInCyrodiil()
-    if not IsInCyrodiil() or IsInImperialCity() or IsActiveWorldBattleground() then
+-- Cyrodiil and the Imperial City, the two places the kill feed reports PvP kills that this log is for;
+-- the third, a Battleground, is left out. The Imperial City is a zone of its own (IsInCyrodiil is false
+-- there), and its campaigns are fought in it, so both are covered by asking about the city as well as
+-- about Cyrodiil. A Battleground is excluded by its own test rather than by IsInCyrodiil being false in
+-- it, because the documentation does not say what IsInCyrodiil is there.
+function ADDON.IsInPvpArea()
+    if IsActiveWorldBattleground() then
         return false
     end
-    local campaignId = GetCurrentCampaignId()
-    return campaignId == 0 or not IsImperialCityCampaign(campaignId)
+    return IsInCyrodiil() or IsInImperialCity()
 end
 
--- The log is drawn only in Cyrodiil. The window itself stays where it is (it is what the unlock frame
--- is drawn on); it is the text that is hidden elsewhere. Run at every loading screen, which is how a
--- player gets into or out of Cyrodiil.
+-- The log is drawn only in Cyrodiil and the Imperial City. The window itself stays where it is (it is
+-- what the unlock frame is drawn on); it is the text that is hidden elsewhere. Run at every loading
+-- screen, which is how a player gets into or out of those places.
 local function UpdateLogVisibility()
-    buffer:SetHidden(not ADDON.IsInCyrodiil())
+    buffer:SetHidden(not ADDON.IsInPvpArea())
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -179,6 +180,7 @@ local function IsLocalPlayer(displayName, characterName)
     end
     return characterName ~= "" and characterName == GetRawUnitName("player")
 end
+ADDON.IsLocalPlayer = IsLocalPlayer
 
 -- The sound the Tales of Tribute board plays when a card's health runs out (ZO_TributeCard:
 -- UpdateDefeatCost). The UI has no separate sound for a card being destroyed.
@@ -200,8 +202,8 @@ end
 -- The "PvP Kill Feed" option in the social settings is deliberately NOT consulted: the built-in chat
 -- handler checks it, but the event itself is delivered to addons regardless.
 local function OnPvpKillFeedDeath(_, killLocation, killerDisplayName, killerCharacterName, killerAlliance, killerRank, victimDisplayName, victimCharacterName, victimAlliance, victimRank, isKillLocation)
-    -- The feed also reports the Imperial City and Battlegrounds; this log is for Cyrodiil only.
-    if not ADDON.IsInCyrodiil() then
+    -- The feed also reports Battlegrounds; this log is for Cyrodiil and the Imperial City only.
+    if not ADDON.IsInPvpArea() then
         return
     end
 
@@ -227,7 +229,18 @@ local function OnPvpKillFeedDeath(_, killLocation, killerDisplayName, killerChar
         victimRank = victimRank,
     })
 
-    if sv.killSound and IsLocalPlayer(killerDisplayName, killerCharacterName) then
+    local playerIsKiller = IsLocalPlayer(killerDisplayName, killerCharacterName)
+    local playerIsVictim = IsLocalPlayer(victimDisplayName, victimCharacterName)
+
+    -- Counted whatever the sound option is. A player on both sides (which the feed should not
+    -- report) is counted once, as a death.
+    if playerIsVictim then
+        ADDON.records:OnDeath(killerDisplayName, killerCharacterName)
+    elseif playerIsKiller then
+        ADDON.records:OnKill(victimDisplayName, victimCharacterName)
+    end
+
+    if sv.killSound and playerIsKiller then
         ADDON.PlayKillSound()
     end
 end
@@ -338,6 +351,7 @@ end
 local function Print(text)
     CHAT_ROUTER:AddSystemMessage("[PBsKillLog] " .. text)
 end
+ADDON.Print = Print
 
 local function OnSlashCommand(argument)
     local command, option = string.lower(argument or ""):match("^%s*(%S*)%s*(%S*)")
@@ -348,13 +362,27 @@ local function OnSlashCommand(argument)
         Print(L("CMD_LOCKED"))
     elseif command == "test" then
         ADDON.AddTestEntry()
-        if not ADDON.IsInCyrodiil() then
+        if not ADDON.IsInPvpArea() then
             -- The line is in the log but the log is not drawn here.
             Print(L("CMD_TEST_ELSEWHERE"))
         end
     elseif command == "clear" then
         ADDON.ClearLog()
         Print(L("CMD_CLEARED"))
+    elseif command == "stats" then
+        for _, line in ipairs(ADDON.records:SummaryLines()) do
+            Print(line)
+        end
+    elseif command == "ranking" then
+        -- "day", "month" or "all" choose the period and show the window; nothing flips it on and off
+        local periods = { day = "today", month = "thismonth", all = "all" }
+        if periods[option] then
+            ADDON.ranking:SetScope(periods[option])
+            ADDON.ranking:SetWanted(true)
+            Print(string.format(L("CMD_RANKING_SCOPE"), ADDON.records:ScopeText(periods[option])))
+        else
+            Print(ADDON.ranking:Toggle() and L("CMD_RANKING_ON") or L("CMD_RANKING_OFF"))
+        end
     elseif command == "preview" then
         Print(ADDON.preview and ADDON.preview:Toggle() and L("CMD_PREVIEW_ON") or L("CMD_PREVIEW_OFF"))
     elseif command == "sound" then
@@ -406,6 +434,7 @@ local function OnAddOnLoaded(_, addonName)
     ADDON.defaults = BuildDefaults()
     sv = ZO_SavedVars:NewAccountWide(SAVED_VARS_NAME, SAVED_VARS_VERSION, nil, ADDON.defaults)
     ADDON.sv = sv
+    ADDON.records:Initialize(sv)
 
     window = PBsKillLogWindow
     frame = PBsKillLogWindowFrame
